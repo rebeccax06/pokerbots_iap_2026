@@ -1,5 +1,5 @@
 '''
-Simple example pokerbot, written in Python.
+MCCFR-based poker bot for Texas Hold'em Toss variant.
 '''
 from skeleton.actions import FoldAction, CallAction, CheckAction, RaiseAction, DiscardAction
 from skeleton.states import GameState, TerminalState, RoundState
@@ -7,12 +7,13 @@ from skeleton.states import NUM_ROUNDS, STARTING_STACK, BIG_BLIND, SMALL_BLIND
 from skeleton.bot import Bot
 from skeleton.runner import parse_args, run_bot
 
-import random
+import os
+from cfr_policy import CFRPolicy
 
 
 class Player(Bot):
     '''
-    A pokerbot.
+    MCCFR-based poker bot.
     '''
 
     def __init__(self):
@@ -25,7 +26,14 @@ class Player(Bot):
         Returns:
         Nothing.
         '''
-        pass
+        # Load trained strategy
+        strategy_path = os.path.join(os.path.dirname(__file__), "cfr_strategy.pkl")
+        self.policy = CFRPolicy(strategy_path)
+        
+        # Track game state
+        self.my_discarded_card = None
+        self.opp_discarded_card = None
+        self.betting_history_current_street = []
 
     def handle_new_round(self, game_state, round_state, active):
         '''
@@ -39,13 +47,10 @@ class Player(Bot):
         Returns:
         Nothing.
         '''
-        my_bankroll = game_state.bankroll  # the total number of chips you've gained or lost from the beginning of the game to the start of this round
-        # the total number of seconds your bot has left to play this game
-        game_clock = game_state.game_clock
-        round_num = game_state.round_num  # the round number from 1 to NUM_ROUNDS
-        my_cards = round_state.hands[active]  # your cards
-        big_blind = bool(active)  # True if you are the big blind
-        pass
+        # Reset round-specific tracking
+        self.my_discarded_card = None
+        self.opp_discarded_card = None
+        self.betting_history_current_street = []
 
     def handle_round_over(self, game_state, terminal_state, active):
         '''
@@ -98,24 +103,80 @@ class Player(Bot):
         my_contribution = STARTING_STACK - my_stack
         # the number of chips your opponent has contributed to the pot
         opp_contribution = STARTING_STACK - opp_stack
-
-        # Only use DiscardAction if it's in legal_actions (which already checks street)
-        # legal_actions() returns DiscardAction only when street is 2 or 3
+        pot = my_contribution + opp_contribution
+        
+        # Determine position
+        position = (active == round_state.button)
+        
+        # Track discarded cards from board
+        # Board starts with 2 flop cards, then discards are added
+        if len(board_cards) > 2 and self.my_discarded_card is None:
+            # Check if any board card is from discards
+            # This is tricky - we need to track when cards appear on board
+            # For now, we'll extract discards if possible
+            if len(board_cards) == 3:
+                # One player has discarded
+                if len(my_cards) == 2:
+                    # We've discarded, so board[-1] is ours
+                    self.my_discarded_card = board_cards[-1]
+                else:
+                    # Opponent discarded
+                    self.opp_discarded_card = board_cards[-1]
+            elif len(board_cards) == 4:
+                # Both have discarded
+                if self.my_discarded_card is None and len(my_cards) == 2:
+                    # Identify which cards are discards (last 2 added to board)
+                    # This is approximate - in real engine we'd track better
+                    pass
+        
+        # Reset betting history on new street
+        if round_state.previous_state is None or round_state.previous_state.street != street:
+            self.betting_history_current_street = []
+        
+        # Handle discard action
         if DiscardAction in legal_actions:
-            # Always discards the first card in the bot's hand
-            return DiscardAction(0)
-        if RaiseAction in legal_actions:
-            # the smallest and largest numbers of chips for a legal bet/raise
-            min_raise, max_raise = round_state.raise_bounds()
-            min_cost = min_raise - my_pip  # the cost of a minimum bet/raise
-            max_cost = max_raise - my_pip  # the cost of a maximum bet/raise
-            if random.random() < 0.5:
-                return RaiseAction(min_raise)
-        if CheckAction in legal_actions:  # check-call
-            return CheckAction()
-        if random.random() < 0.25:
-            return FoldAction()
-        return CallAction()
+            discard_idx = self.policy.get_discard_decision(
+                my_cards=my_cards,
+                board_cards=board_cards,
+                player_id=active,
+                position=position
+            )
+            
+            # Track our discard
+            if discard_idx < len(my_cards):
+                self.my_discarded_card = my_cards[discard_idx]
+            
+            action = DiscardAction(discard_idx)
+            self.betting_history_current_street.append(f"D{discard_idx}")
+            return action
+        
+        # Handle betting action
+        action = self.policy.get_betting_decision(
+            my_cards=my_cards,
+            board_cards=board_cards,
+            discarded_by_us=self.my_discarded_card,
+            discarded_by_opp=self.opp_discarded_card,
+            street=street,
+            my_pip=my_pip,
+            opp_pip=opp_pip,
+            my_stack=my_stack,
+            opp_stack=opp_stack,
+            pot=pot,
+            legal_actions=legal_actions,
+            player_id=active,
+            position=position,
+            betting_history=self.betting_history_current_street
+        )
+        
+        # Track action in history
+        if isinstance(action, FoldAction):
+            self.betting_history_current_street.append("F")
+        elif isinstance(action, (CheckAction, CallAction)):
+            self.betting_history_current_street.append("C")
+        elif isinstance(action, RaiseAction):
+            self.betting_history_current_street.append("R")
+        
+        return action
 
 
 if __name__ == '__main__':
